@@ -11,6 +11,7 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -21,21 +22,54 @@ namespace RocketMov
         private List<FileDesc> _files = new List<FileDesc>();
         int fileId = 1;
 
+        private ConvertOptions _convertOptions = new ConvertOptions();
+        private bool _stateConverting = false;
+        private double _stateProgress = 0;
+        private FileDesc _stateSelectedFile;
+
+        private Action _cancelConvertion;
+        private Thread _converter;
+
         public frmMain()
         {
             InitializeComponent();
         }
 
+        public void ReadOptions()
+        {
+            try
+            {
+                _convertOptions.Width = int.Parse(cbVideoSize.Text.Split('x')[0]);
+                _convertOptions.Height = int.Parse(cbVideoSize.Text.Split('x')[1]);
+                _convertOptions.Bitrate = int.Parse(cbVideoBitrate.Text);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Invalid arguments");
+            }
+        }
+
         private void frmMain_Load(object sender, EventArgs e)
         {
+            ReadOptions();
             //lvFiles.Items.Add(new ListViewItem(new[] { "0", "1", "2", "3" }));
             //AddFile(@"F:\Pictures\Tmp\New\2019\(09) LenaPhone\Video\2019-09-02 11-44-03.MOV");
         }
 
         private void lvFiles_SelectedIndexChanged(object sender, EventArgs e)
         {
-            Console.WriteLine(1);
-            //lvFiles.SelectedItems[0];
+            if (lvFiles.SelectedIndices.Count > 0)
+            {
+                var item = lvFiles.Items[lvFiles.SelectedIndices[0]];
+                int fileId = int.Parse(item.SubItems[0].Text);
+                _stateSelectedFile = _files.First(f => f.Id == fileId);
+            }
+            else
+            {
+                _stateSelectedFile = null;
+            }
+
+            UpateUI();
         }
 
         private void lvFiles_DragDrop(object sender, DragEventArgs e)
@@ -69,26 +103,59 @@ namespace RocketMov
 
             _files.Add(file);
 
-            var viewDesc = GetViewDesc(file);
+            UpateUI();
+        }
 
-            AddOrUpdateFileDesc(viewDesc);
+        private void UpateUI()
+        {
+            if (InvokeRequired)
+            {
+                Action d = new Action(UpateUI);
+                Invoke(d);
+                return;
+            }
+
+            var files = _files.ToArray();
+
+            for (int j = 0; j < files.Length; j++)
+            {
+                var viewDes = GetViewDesc(files[j]);
+                AddOrUpdateFileDesc(viewDes);
+            }
+
+            cbConvert.Enabled = !_stateConverting;
+            cbStop.Enabled = _stateConverting;
+
+            pbCurrent.Value = (int)_stateProgress;
+            pbCurrent.Visible = _stateConverting;
+
+            txtFileError.Text = _stateSelectedFile?.Error;
         }
 
         private void AddOrUpdateFileDesc(FileViewDesc viewDesc)
         {
-            if (InvokeRequired)
-            {
-                Action<FileViewDesc> d = new Action<FileViewDesc>(AddOrUpdateFileDesc);
-                Invoke(d, viewDesc);
-                return;
-            }
-
             for (int i = 0; i < lvFiles.Items.Count; i++)
             {
                 var lvi = lvFiles.Items[i] as ListViewItem;
                 if (lvi.Text == viewDesc.Id)
                 {
-                    lvFiles.Items[i] = viewDesc.ToListViewItem();
+                    var newItem = viewDesc.ToListViewItem();
+
+                    bool isChanged = false;
+                    for (int j = 0; j < newItem.SubItems.Count; j++)
+                    {
+                        if (newItem.SubItems[j].Text != lvi.SubItems[j].Text)
+                        {
+                            isChanged = true;
+                            break;
+                        }
+                    }
+
+                    if (isChanged)
+                    {
+                        lvFiles.Items[i] = viewDesc.ToListViewItem();
+                    }
+
                     return;
                 }
             }
@@ -117,33 +184,61 @@ namespace RocketMov
 
         private void cbConvert_Click(object sender, EventArgs e)
         {
-            cbConvert.Enabled = false;
+            _converter?.Abort();
+
+            _converter = new Thread(ConvertFiles);
+            _converter.IsBackground = true;
+            _converter.Start();
+        }
+
+        private void ConvertFiles()
+        {
             var files = _files.ToArray();
+            _stateConverting = true;
+            UpateUI();
 
             foreach (var file in files)
             {
+                if (!_stateConverting)
+                {
+                    break;
+                }
+
                 if (file.Status == FileStatus.Wait)
                 {
                     ConvertFile(file);
                 }
             }
 
-            cbConvert.Enabled = true;
+            _stateConverting = false;
+            UpateUI();
         }
-
-
-
 
         private void ConvertFile(FileDesc file)
         {
             file.Status = FileStatus.Converting;
-            AddOrUpdateFileDesc(GetViewDesc(file));
+            _stateProgress = 0;
+            UpateUI();
 
-            //ConverterV1(file);
-            ConverterV2(file);
+            try
+            {
+                //ConverterV1(file);
+                ConverterV2(file);
 
-            file.Status = FileStatus.Converted;
-            AddOrUpdateFileDesc(GetViewDesc(file));
+                file.Status = FileStatus.Converted;
+            }
+            catch (FFMpegCore.Exceptions.FFMpegException ex)
+            {
+                file.Status = FileStatus.Fail;
+                file.Error = ex.Message + "\r\n" + ex.FfmpegErrorOutput.Replace("\n","\r\n");
+            }
+            catch (Exception ex)
+            {
+                file.Status = FileStatus.Fail;
+                file.Error = ex.Message;
+            }
+
+            UpateUI();
         }
 
         private void ConverterV1(FileDesc file)
@@ -171,18 +266,28 @@ namespace RocketMov
         private void ConverterV2(FileDesc file)
         {
             FFMpegOptions.Configure(new FFMpegOptions { RootDirectory = @"D:\Git\RocketMov\RocketMov\ffmpeg" });
-
+            var fileInfo = FFProbe.Analyse(file.PathIn);
             FFMpegArguments
                 .FromFileInput(file.PathIn)
                 .OutputToFile(file.PathOut, true, options => options
                     .WithVideoCodec(VideoCodec.LibX264)
                     .WithConstantRateFactor(21)
                     .WithAudioCodec(AudioCodec.Aac)
-                    .WithVariableBitrate(4)
+                    .WithVideoBitrate(_convertOptions.Bitrate)
                     .WithFastStart()
-                    .Scale(720, 1280)
+                    .Scale(_convertOptions.Width, _convertOptions.Height)
                     .UsingThreads(4))
+                    .NotifyOnProgress(onConvertProgress, fileInfo.Duration)
+                    .CancellableThrough(out _cancelConvertion)
                 .ProcessSynchronously();
+        }
+
+
+
+        private void onConvertProgress(double obj)
+        {
+            _stateProgress = obj;
+            UpateUI();
         }
 
         private void Engine_ConversionCompleteEvent(object sender, ConversionCompleteEventArgs e)
@@ -193,6 +298,49 @@ namespace RocketMov
         private void Engine_ConvertProgressEvent(object sender, ConvertProgressEventArgs e)
         {
             //pbConvert.Value - e.
+        }
+
+        private void cbVideoSize_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            ReadOptions();
+        }
+
+        private void cbVideoBitrate_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            ReadOptions();
+        }
+
+        private void frmMain_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            try
+            {
+                _cancelConvertion?.Invoke();
+            }
+            catch (Exception ex) { }
+
+            _stateConverting = false;
+        }
+
+        private void cbStop_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                _cancelConvertion?.Invoke();
+            }
+            catch (Exception ex) { }
+
+            _stateConverting = false;
+            UpateUI();
+        }
+
+        private void cbVideoSize_TextUpdate(object sender, EventArgs e)
+        {
+            ReadOptions();
+        }
+
+        private void cbVideoBitrate_TextUpdate(object sender, EventArgs e)
+        {
+            ReadOptions();
         }
     }
 
@@ -217,6 +365,7 @@ namespace RocketMov
         public string Name { get; set; }
         public long Size { get; set; }
         public FileStatus Status { get; set; }
+        public string Error { get; set; }
     }
 
     public enum FileStatus
